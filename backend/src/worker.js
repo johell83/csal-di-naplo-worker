@@ -226,7 +226,6 @@ button{font:inherit;cursor:pointer}
 
 <footer class="site-footer">
   <div class="masthead-h">
-    <span class="masthead-h__eyebrow">Család újság</span>
     <span class="masthead-h__word">Család napló</span>
     <span class="masthead-h__sub">csaladinaplo.hu</span>
   </div>
