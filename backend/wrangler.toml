@@ -1,0 +1,44 @@
+# Worker API csaladinaplo-api — compte PROD Joelle.marquie@mtb.group
+# Déploiement : `npx wrangler deploy` (après `npx wrangler login` une seule fois)
+# ⚠️ Le MCP/connecteur Cloudflare de Cowork est sur un AUTRE compte (joellecb@gmail.com)
+#    et ne voit pas ce Worker ni cette base — utiliser wrangler ou le dashboard.
+
+name = "csaladinaplo-api"
+main = "src/worker.js"
+compatibility_date = "2026-06-08"
+account_id = "74a6608a72c0d9b625649710e90fae31"
+
+# ── Route publique ─────────────────────────────────────────────────────────────
+# ✅ 10 juin 2026 : route élargie de `csaladinaplo.hu/waitlist*` à `csaladinaplo.hu/*`
+#    (dashboard → zone csaladinaplo.hu → Workers Routes). La landing « voile » est
+#    servie sur GET / et /waitlist ; /api/* va à l'API. La route zone prend le pas
+#    sur le custom domain du Worker front `csaladinaplo` (ancien site masqué).
+routes = [
+  { pattern = "csaladinaplo.hu/*", zone_name = "csaladinaplo.hu" }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "csaladinaplo-db"
+database_id = "1f35e32d-e7bb-4906-ab68-e1f46f778051"
+
+# ── Images (R2) ────────────────────────────────────────────────────────────────
+# ✅ R2 ACTIVÉ le 10 juin 2026. Bucket `csaladinaplo-images` créé (location ENAM).
+# ✅ CUSTOM DOMAIN connecté le 10 juin 2026 : https://img.csaladinaplo.hu
+#    (R2 → bucket → Settings → Custom Domains ; CNAME `img` géré par Cloudflare).
+#    L'URL r2.dev (rate-limitée, dév uniquement) est désactivée — ne pas la réactiver.
+#    Worker + app (VITE_IMG_BASE) redéployés avec la nouvelle base le 10 juin 2026.
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "csaladinaplo-images"
+
+[vars]
+# URL publique du bucket R2 des images (post.img_key → URL publique).
+IMG_BASE = "https://img.csaladinaplo.hu/"
+
+# Cron des rappels (scheduled) — décommenter pour activer :
+# [triggers]
+# crons = ["0 9 * * *"]
+
+# Secrets (à poser via `npx wrangler secret put NOM` ou Dashboard → Variables and Secrets) :
+#   SZAMLAZZ_AGENT_KEY, BARION_POSKEY, RESEND_API_KEY (selon phases)

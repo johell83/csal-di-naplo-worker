@@ -1,0 +1,21 @@
+{
+  "name": "csaladinaplo-api",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for Családi Napló landing page",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "cloudflare",
+    "worker",
+    "familj-naplo"
+  ],
+  "author": "Joelle",
+  "license": "All rights reserved",
+  "devDependencies": {
+    "wrangler": "^4.100.0"
+  }
+}
