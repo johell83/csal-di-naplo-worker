@@ -594,8 +594,9 @@ async function handleApi(request, env, url) {
       // Send confirmation email
       if (env.BREVO_API_KEY && subRow.recipient_email) {
         try {
-          const e = lifecycleEmail('payment', subRow.language || 'hu', { amount: subRow.amount, currency: subRow.currency });
-          await brevoSendEmail(env, { to: [{ email: subRow.recipient_email }], subject: e.subject, htmlContent: e.htmlContent });
+          const subject = subRow.language === 'fr' ? 'Paiement reçu — Családi napló' : 'Fizetés megérkezett — Családi napló';
+          const htmlContent = `<h2>Köszönjük az előfizetést!</h2><p>Az abonnement aktiválva.</p>`;
+          await brevoSendEmail(env, { to: [{ email: subRow.recipient_email }], subject, htmlContent });
         } catch (_) { /* best-effort */ }
       }
 
@@ -634,8 +635,9 @@ async function handleApi(request, env, url) {
         }
         if (email) {
           try {
-            const e = lifecycleEmail('payment', lang || 'hu', { plan: b.plan, amount: b.amount, currency: b.currency });
-            mail = await brevoSendEmail(env, { to: [{ email }], subject: e.subject, htmlContent: e.htmlContent });
+            const subject = (lang === 'fr') ? 'Paiement reçu — Családi napló' : 'Fizetés megérkezett — Családi napló';
+            const htmlContent = `<h2>${(lang === 'fr') ? 'Merci!' : 'Köszönjük!'}</h2><p>${(lang === 'fr') ? 'Votre abonnement est actif.' : 'Az abonnement aktiválva.'}</p>`;
+            mail = await brevoSendEmail(env, { to: [{ email }], subject, htmlContent });
           } catch (err) { mail = { ok: false, error: String(err) }; }
         }
       }
@@ -849,10 +851,5 @@ async function sendWelcome(env, email, name, lang, code) {
       email, attributes: { PRENOM: name || '', LANG: lang, CODE: code || '' },
       listIds: env.BREVO_LIST_ID ? [Number(env.BREVO_LIST_ID)] : undefined,
     });
-    const e = lifecycleEmail('welcome', lang, { name, code });
-    return await brevoSendEmail(env, { to: [{ email, name: name || '' }], subject: e.subject, htmlContent: e.htmlContent });
-  } catch (err) { return { ok: false, error: String(err) }; }
-}
-
-/* --- Génère un code famille unique : préfixe ASCII du nom + 4 chiffres (ex. KOV-7821) --- */
-function asciiPrefix(s)
+    const subject = (lang === 'fr') ? 'Bienvenue sur Családi napló!' : 'Üdvözlünk a Családi naplóban!';
+    const h
