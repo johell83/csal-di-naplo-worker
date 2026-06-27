@@ -226,6 +226,7 @@ button{font:inherit;cursor:pointer}
 
 <footer class="site-footer">
   <div class="masthead-h">
+    <span class="masthead-h__eyebrow">Család újság</span>
     <span class="masthead-h__word">Család napló</span>
     <span class="masthead-h__sub">csaladinaplo.hu</span>
   </div>
@@ -460,6 +461,148 @@ async function handleApi(request, env, url) {
       } catch (err) { payment = { ok: false, error: String(err) }; }
     }
     return json({ ok: true, subscription_id: subscriptionId, status: 'pending', payment }, 201);
+  }
+
+  // POST /api/payment/barion/start  Direct Barion payment (no díjbekérő)
+  // { family_id, zone, frequency, amount, currency?, buyer:{name,email,zip,city,address,country?,taxNumber?}, language?, itemName? }
+  if (path === '/api/payment/barion/start' && method === 'POST') {
+    if (!env.BARION_POSKEY) return bad('barion_poskey_missing', 500);
+    const b = await readJson(request);
+    if (!b.family_id || !b.zone || !b.frequency || !b.amount || !b.buyer || !b.buyer.email) {
+      return bad('missing_fields: family_id, zone, frequency, amount, buyer.email required');
+    }
+    const currency = b.currency || (b.zone === 'hu' ? 'HUF' : 'EUR');
+    try {
+      // Create subscription
+      const res = await env.DB
+        .prepare(`INSERT INTO subscription (family_id, zone, frequency, currency, amount, status)
+                  VALUES (?1,?2,?3,?4,?5,'pending')`)
+        .bind(b.family_id, b.zone, b.frequency, currency, b.amount).run();
+      const subscriptionId = res.meta.last_row_id;
+
+      // Create Barion payment session
+      const barionPayment = {
+        POSKey: env.BARION_POSKEY,
+        PaymentType: 'Immediate',
+        Currency: currency,
+        OrderNumber: `CLN-SUB-${subscriptionId}`,
+        Description: b.itemName || `Családi napló előfizetés (${b.frequency})`,
+        Items: [{
+          Name: b.itemName || `Családi napló előfizetés (${b.frequency})`,
+          Description: `${b.frequency} havi előfizetés`,
+          Quantity: 1,
+          Unit: 'db',
+          UnitPrice: b.amount,
+          ItemTotal: b.amount,
+        }],
+        Total: b.amount,
+        Guest: {
+          Email: b.buyer.email,
+          FirstName: (b.buyer.name || '').split(' ')[0],
+          LastName: (b.buyer.name || '').split(' ').slice(1).join(' '),
+          Country: b.buyer.country || 'HU',
+          PostalCode: b.buyer.zip || '',
+          City: b.buyer.city || '',
+          Address: b.buyer.address || '',
+        },
+        RedirectUrl: `https://csaladinaplo.hu/payment/success?sub=${subscriptionId}`,
+        CallbackUrl: `https://csaladinaplo.hu/api/payment/barion/callback`,
+        ResponseUrl: `https://csaladinaplo.hu/payment/response`,
+        UILocale: b.language || 'hu-HU',
+      };
+
+      const barionRes = await fetch('https://api.barion.com/v3/Payment/Start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(barionPayment),
+      });
+      const barionData = await barionRes.json();
+
+      if (!barionData.Success) {
+        return json({ ok: false, error: barionData.ErrorMessage, errors: barionData.Errors }, 502);
+      }
+
+      // Store Barion payment reference
+      await env.DB.prepare(
+        `INSERT INTO payment (subscription_id, provider, provider_payment_id, amount, currency, status, type)
+         VALUES (?1,'barion',?2,?3,?4,'pending','initial')`
+      ).bind(subscriptionId, barionData.PaymentId, b.amount, currency).run();
+
+      return json({ ok: true, subscription_id: subscriptionId, payment_id: barionData.PaymentId, paymentUrl: barionData.PaymentUrl }, 201);
+    } catch (err) {
+      return bad('barion_error: ' + String(err), 502);
+    }
+  }
+
+  // GET /api/payment/barion/callback  (Barion IPN callback)
+  // After payment success → create invoice via Számlázz + send confirmation email
+  if (path === '/api/payment/barion/callback' && method === 'GET') {
+    const paymentId = new URL(request.url).searchParams.get('paymentId');
+    if (!paymentId) return bad('payment_id_required');
+
+    try {
+      // Get subscription from payment
+      const payRow = await env.DB.prepare(
+        `SELECT subscription_id FROM payment WHERE provider_payment_id = ?1`
+      ).bind(paymentId).first();
+
+      if (!payRow) return bad('payment_not_found');
+
+      const subId = payRow.subscription_id;
+      const subRow = await env.DB.prepare(
+        `SELECT s.*, f.name as family_name, r.email as recipient_email, r.language
+         FROM subscription s
+         JOIN family f ON f.id = s.family_id
+         LEFT JOIN recipient r ON r.id = f.recipient_id
+         WHERE s.id = ?1`
+      ).bind(subId).first();
+
+      if (!subRow) return bad('subscription_not_found');
+
+      // Update subscription to active
+      await env.DB.prepare(`UPDATE subscription SET status='active' WHERE id=?1`).bind(subId).run();
+
+      // Create invoice via Számlázz if available
+      let invoice = null;
+      if (env.SZAMLAZZ_AGENT_KEY && subRow.family_name) {
+        const vatRate = subRow.zone === 'hu' ? 27 : 0;
+        const net = vatRate ? Math.round(subRow.amount / (1 + vatRate / 100)) : subRow.amount;
+        const item = {
+          name: `Családi napló előfizetés (${subRow.frequency})`,
+          qty: 1,
+          unit: 'db',
+          netUnit: net,
+          vat: vatRate ? String(vatRate) : 'AAM',
+          net,
+          vatAmount: subRow.amount - net,
+          gross: subRow.amount,
+        };
+        try {
+          invoice = await szamlazzDijbekero(env, {
+            orderNumber: `CLN-SUB-${subId}`,
+            currency: subRow.currency,
+            language: subRow.language || 'hu',
+            buyer: { name: subRow.family_name, email: subRow.recipient_email || '' },
+            items: [item],
+            dueDays: 0,
+            emailSubject: 'Családi napló — számla',
+            emailBody: 'Köszönjük az előfizetést!',
+          });
+        } catch (err) { invoice = { ok: false, error: String(err) }; }
+      }
+
+      // Send confirmation email
+      if (env.BREVO_API_KEY && subRow.recipient_email) {
+        try {
+          const e = lifecycleEmail('payment', subRow.language || 'hu', { amount: subRow.amount, currency: subRow.currency });
+          await brevoSendEmail(env, { to: [{ email: subRow.recipient_email }], subject: e.subject, htmlContent: e.htmlContent });
+        } catch (_) { /* best-effort */ }
+      }
+
+      return json({ ok: true, subscription_id: subId, status: 'active', invoice });
+    } catch (err) {
+      return bad('callback_error: ' + String(err), 502);
+    }
   }
 
   // POST /api/payment/callback  (IPN Barion/Számlázz) { subscription_id, status, payment_id?, amount?, currency?, email?, lang?, plan? }
@@ -712,91 +855,4 @@ async function sendWelcome(env, email, name, lang, code) {
 }
 
 /* --- Génère un code famille unique : préfixe ASCII du nom + 4 chiffres (ex. KOV-7821) --- */
-function asciiPrefix(s) {
-  const p = String(s || '').normalize('NFD').replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3);
-  return p || 'CSN';
-}
-async function genFamilyCode(env, surname) {
-  const pre = asciiPrefix(surname);
-  for (let i = 0; i < 8; i++) {
-    const code = `${pre}-${Math.floor(1000 + Math.random() * 9000)}`;
-    const ex = await env.DB.prepare('SELECT 1 FROM family WHERE code = ?1').bind(code).first();
-    if (!ex) return code;
-  }
-  return `${pre}-${String(Date.now()).slice(-5)}`;
-}
-
-/* --- Emails de cycle de vie (HU/FR/EN) : welcome | payment | reminder --- */
-const MAIL_FOOTER = {
-  hu: '— A Családi napló csapata · csaladinaplo.hu',
-  fr: '— L’équipe Családi napló · csaladinaplo.hu',
-  en: '— The Családi napló team · csaladinaplo.hu',
-};
-function mailShell(bodyHtml, lang) {
-  return `<div style="font-family:Georgia,serif;color:#241a10;max-width:560px;margin:0 auto;line-height:1.5">
-${bodyHtml}
-<p style="color:#7c6451;margin-top:24px">${MAIL_FOOTER[lang] || MAIL_FOOTER.hu}</p></div>`;
-}
-function lifecycleEmail(kind, lang0, d = {}) {
-  const lang = ['hu', 'fr', 'en'].includes(lang0) ? lang0 : 'hu';
-  const nm = d.name ? ' ' + d.name : '';
-  if (kind === 'welcome') {
-    const S = { hu: 'Üdvözlünk a Családi naplónál! 🌼', fr: 'Bienvenue sur Családi napló ! 🌼', en: 'Welcome to Családi napló! 🌼' };
-    const B = {
-      hu: `<h2 style="color:#bc5e22">Üdvözlünk${nm}!</h2><p>Köszönjük, hogy csatlakoztál a Családi naplóhoz. A család közös bejegyzéseiből rendszeresen <strong>nyomtatott újság</strong> készül, amelyet postán küldünk a nagyinak. 💛</p>${d.code ? `<p>Családi kód: <strong>${d.code}</strong> — oszd meg a rokonokkal!</p>` : ''}`,
-      fr: `<h2 style="color:#bc5e22">Bienvenue${nm} !</h2><p>Merci d’avoir rejoint Családi napló. Les publications de la famille deviennent un <strong>journal imprimé</strong> envoyé régulièrement par la poste à l’aîné. 💛</p>${d.code ? `<p>Code famille : <strong>${d.code}</strong> — partage-le avec tes proches !</p>` : ''}`,
-      en: `<h2 style="color:#bc5e22">Welcome${nm}!</h2><p>Thanks for joining Családi napló. The family’s posts become a <strong>printed newspaper</strong> mailed regularly to grandma. 💛</p>${d.code ? `<p>Family code: <strong>${d.code}</strong> — share it with your relatives!</p>` : ''}`,
-    };
-    return { subject: S[lang], htmlContent: mailShell(B[lang], lang) };
-  }
-  if (kind === 'payment') {
-    const S = { hu: 'Sikeres előfizetés — Családi napló ✅', fr: 'Abonnement confirmé — Családi napló ✅', en: 'Subscription confirmed — Családi napló ✅' };
-    const amt = d.amount != null ? `${d.amount} ${d.currency || ''}`.trim() : '';
-    const B = {
-      hu: `<h2 style="color:#bc5e22">Köszönjük az előfizetést!</h2><p>Az előfizetésed aktív${d.plan ? ` (<strong>${d.plan}</strong>)` : ''}${amt ? ` — ${amt}` : ''}. A következő lapszámot hamarosan nyomtatjuk és postázzuk. 💛</p>`,
-      fr: `<h2 style="color:#bc5e22">Merci pour ton abonnement !</h2><p>Ton abonnement est actif${d.plan ? ` (<strong>${d.plan}</strong>)` : ''}${amt ? ` — ${amt}` : ''}. Le prochain numéro sera bientôt imprimé et posté. 💛</p>`,
-      en: `<h2 style="color:#bc5e22">Thank you for subscribing!</h2><p>Your subscription is active${d.plan ? ` (<strong>${d.plan}</strong>)` : ''}${amt ? ` — ${amt}` : ''}. The next issue will be printed and mailed soon. 💛</p>`,
-    };
-    return { subject: S[lang], htmlContent: mailShell(B[lang], lang) };
-  }
-  // kind === 'reminder' — rappel avant la clôture du numéro mensuel
-  const S = {
-    hu: 'Emlékeztető: hamarosan zárul a havi újság ✍️',
-    fr: 'Rappel : le journal du mois est bientôt bouclé ✍️',
-    en: 'Reminder: this month’s journal closes soon ✍️',
-  };
-  const B = {
-    hu: `<h2 style="color:#bc5e22">Ne maradj le${nm}!</h2><p>Hamarosan lezárjuk a havi lapszámot${d.deadline ? ` (<strong>${d.deadline}</strong>)` : ''}. Tölts fel még egy-két képet vagy történetet, hogy a nagyi újságja tele legyen élettel! 📷</p>`,
-    fr: `<h2 style="color:#bc5e22">Ne rate pas le numéro${nm} !</h2><p>Le journal du mois sera bientôt bouclé${d.deadline ? ` (<strong>${d.deadline}</strong>)` : ''}. Ajoute encore une photo ou une histoire pour remplir le journal de l’aîné ! 📷</p>`,
-    en: `<h2 style="color:#bc5e22">Don’t miss this issue${nm}!</h2><p>The monthly journal closes soon${d.deadline ? ` (<strong>${d.deadline}</strong>)` : ''}. Add one more photo or story to fill grandma’s newspaper! 📷</p>`,
-  };
-  return { subject: S[lang], htmlContent: mailShell(B[lang], lang) };
-}
-
-/* --- Cron (scheduled) : rappel aux membres 3 jours avant la fin du mois (best-effort) --- */
-async function runReminders(env) {
-  if (!env.DB || !env.BREVO_API_KEY) return { ok: false, skipped: 'db_or_brevo_missing' };
-  const now = new Date();
-  const lastDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
-  if (lastDay - now.getUTCDate() !== 3) return { ok: true, skipped: 'not_reminder_day' };
-  const deadline = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${lastDay}`;
-  const { results } = await env.DB.prepare(
-    `SELECT u.email, u.name, COALESCE(r.language, 'hu') AS language
-       FROM user u JOIN family f ON f.id = u.family_id
-       LEFT JOIN recipient r ON r.id = f.recipient_id
-      WHERE u.email IS NOT NULL AND u.email <> ''`).all();
-  let sent = 0;
-  for (const u of results || []) {
-    try {
-      const e = lifecycleEmail('reminder', u.language, { name: u.name, deadline });
-      const r = await brevoSendEmail(env, { to: [{ email: u.email, name: u.name || '' }], subject: e.subject, htmlContent: e.htmlContent });
-      if (r.ok) sent++;
-    } catch (_) { /* best-effort */ }
-  }
-  return { ok: true, sent };
-}
-
-/* --- Lecture sûre du corps JSON d'une requête --- */
-async function readJson(request) {
-  try { return (await request.json()) || {}; } catch { return {}; }
-}
+function asciiPrefix(s)
